@@ -1,6 +1,7 @@
 import unittest, sys, os, json, warnings, requests, logging
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
+from unittest.mock import mock_open, patch, call
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -419,11 +420,198 @@ class ParseTestCase(unittest.TestCase):
 
 class CleanTestCase(unittest.TestCase):
 
-    def test_cleaner_hays(self):
+    def setUp(self):
+        self.cleaner = Cleaner() # Create Cleaner instance here to avoid repeating this in every test
 
-        now = datetime.now()
-        now_string = now.strftime("%H:%M:%S")
-        # Call the function being tested
-        #cleaner(counter="hays")
+    # Create mock functions
+    @patch('os.makedirs') 
+    @patch('os.path.exists', return_value=False)
+    def test_get_or_create_folder_path(self, mock_exists, mock_makedirs):
+        mock_exists.return_value = False
+        county = "hays"
+        folder_type = "case_json"
+        expected_path = os.path.join(os.path.dirname(__file__), "..", "..", "data", "hays", "case_json")
 
-        # Need to finish coding this.
+        folder_path = self.cleaner.get_or_create_folder_path(county, folder_type)
+
+        mock_exists.assert_called_once_with(expected_path)  # Check if os.path.exists was called
+        mock_makedirs.assert_called_once_with(expected_path)  # Check if os.makedirs was called
+        self.assertEqual(folder_path, expected_path)  # Check that the path is correct
+
+        # Test when folder already exists
+        mock_exists.return_value = True
+        folder_path = self.cleaner.get_or_create_folder_path(county, folder_type)
+        mock_makedirs.assert_called_once() # Should not be called again
+
+    def test_load_json_file(self):
+        # Test successful load
+        with patch("builtins.open", new_callable=mock_open, read_data='{"key": "value"}'):
+            result = self.cleaner.load_json_file("fake_path.json")
+            self.assertEqual(result, {"key": "value"})
+
+        # Test file not found
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            result = self.cleaner.load_json_file("nonexistent.json")
+            self.assertEqual(result, {})
+        
+        # Test invalid JSON
+        with patch("builtins.open", new_callable=mock_open, read_data='invalid json'):
+            result = self.cleaner.load_json_file("invalid.json")
+            self.assertEqual(result, {})
+
+    @patch("builtins.open", new_callable=mock_open, read_data = '[{"charge_name": "Charge1", "details": "Some details"}]')
+    def test_load_and_map_charge_names(self, mock_file):
+        file_path = "fake_path.json"
+        result = self.cleaner.load_and_map_charge_names(file_path)
+
+        self.assertEqual(result, {"Charge1": {"charge_name": "Charge1", "details": "Some details"}})
+        mock_file.assert_called_once_with(file_path, "r")
+
+    def test_hash_defense_attorney(self):
+        input_data = {
+            "party information": {
+                "defense attorney": "John Doe",
+                "defense attorney phone number": "555-1234"
+            }
+        }
+        result = self.cleaner.hash_defense_attorney(input_data)
+        # Check that the defense_attorney field is hashed
+        self.assertNotEqual(result,"John Doe:555-1234")  # Ensure it's hashed
+        self.assertIsInstance(result, str)  # Check if the hash is a string
+    
+        # Ensure same input gives the same hash
+        input_data2 = {
+            "party information": {
+                "defense attorney": "John Doe",
+                "defense attorney phone number": "555-1234"
+            }
+        }
+        result2 = self.cleaner.hash_defense_attorney(input_data2)
+        self.assertEqual(result, result2)
+
+        # Ensure different input gives a different hash
+        input_data3 = {
+            "party information": {
+                "defense attorney": "Jane Doe",
+                "defense attorney phone number": "555-1234"
+            }
+        }
+        result3 = self.cleaner.hash_defense_attorney(input_data3)
+        self.assertNotEqual(result, result3)
+
+    def test_process_charges(self):
+        charges = [
+            {"level": "Misdemeanor", "charges": "Charge1", "statute": "123", "date": "12/01/2023"},
+        ]
+        charge_mapping = {"Charge1": {"mapped_field": "mapped_value"}}
+
+        processed_charges, earliest_date = self.cleaner.process_charges(charges, charge_mapping)
+    
+        self.assertEqual(len(processed_charges), 1)
+        self.assertEqual(processed_charges[0]['charge_date'], "2023-12-01")
+        self.assertEqual(earliest_date, "2023-12-01")
+    
+    def test_contains_good_motion(self):
+        self.assertTrue(self.cleaner.contains_good_motion("Motion To Suppress", "Event: Motion To Suppress"))
+        self.assertTrue(self.cleaner.contains_good_motion("Motion To Suppress", ["Other", "Motion To Suppress"]))
+        self.assertFalse(self.cleaner.contains_good_motion("Motion To Suppress", "Other Motion"))
+        self.assertFalse(self.cleaner.contains_good_motion("Motion To Suppress", ["Other1", "Other2"]))
+
+    def test_find_good_motions(self):
+        case_data = [
+            "Motion To Suppress", 
+            "Motion to Reduce Bond", 
+            "Other Event",
+            "Motion for Speedy Trial"
+        ]
+
+        result = self.cleaner.find_good_motions(case_data)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result, ["Motion To Suppress", "Motion to Reduce Bond", "Motion for Speedy Trial"])
+
+    @patch("cleaner.Cleaner.load_json_file")
+    @patch("cleaner.Cleaner.write_json_output")
+    def test_process_single_case(self, mock_write, mock_load):
+        mock_load.return_value = {
+            "code": "123",
+            "party information": {
+                "defense attorney": "John Doe",
+                "defense attorney phone number": "555-1234"
+            },
+            "charge information": [
+                {"level": "Misdemeanor", "charges": "Charge1", "statute": "123", "date": "12/01/2023"}
+            ],
+            "other events and hearings": ["Motion To Suppress"]
+        }
+
+        county = "test_county"
+        folder_path = "case_json_folder"
+        case_file = "case1.json"
+
+        self.cleaner.process_single_case(county, folder_path, case_file)
+
+        mock_load.assert_called_once()
+        mock_write.assert_called_once()
+
+        # Check that the output contains expected fields
+        output_data = mock_write.call_args[0][1]
+        self.assertIn("case_number", output_data)
+        self.assertIn("charges", output_data)
+        self.assertIn("motions", output_data)
+        self.assertIn("defense_attorney", output_data)
+
+    @patch("os.listdir", return_value=["case1.json", "case2.json"])
+    @patch("cleaner.Cleaner.process_single_case")
+    def test_process_json_files(self, mock_process, mock_listdir):
+        county = "test_county"
+        folder_path = "case_json_folder"
+
+        self.cleaner.process_json_files(county, folder_path)
+
+        self.assertEqual(mock_process.call_count, 2)
+        mock_process.assert_any_call(county, folder_path, "case1.json")
+        mock_process.assert_any_call(county, folder_path, "case2.json")
+
+    @patch("builtins.open", new_callable=mock_open)
+    def test_write_json_output(self, mock_file):
+        file_path = "test_output.json"
+        data = {"key": "value"}
+        self.cleaner.write_json_output(file_path, data)
+
+        mock_file.assert_called_once_with(file_path, "w") # Checks mocked open function was called with the correct arguments
+        mock_file().write.assert_called_once_with(json.dumps(data)) # Checks that the write method was called with the json-encoded version of the data dict
+
+    def test_clean(self):
+        county = "hays"
+
+        with patch.object(Cleaner, 'get_or_create_folder_path', return_value = "mock_path") as mock_get_folder, \
+            patch.object(Cleaner, 'process_json_files') as mock_process_json_files, \
+            patch('logging.info') as mock_logging_info, \
+            patch('logging.error') as mock_logging_error:
+
+            self.cleaner.clean(county)
+
+        # Check that get_or_create_folder_path is called once with correct args
+            mock_get_folder.assert_called_once_with(county, "case_json")
+
+        # Check that process_json_files is called once with correct args
+            mock_process_json_files.assert_called_once_with(county, "mock_path")
+
+        # Check that the logging for info was called twice (start and end)
+            mock_logging_info.assert_has_calls([
+                call(f"Processing data for county: {county}"),
+                call(f"Completed processing for county: {county}")
+            ])
+
+        # Check that error logging wasn't called
+            mock_logging_error.assert_not_called()
+
+        # Test exception handling
+        with patch.object(Cleaner, 'get_or_create_folder_path', side_effect = Exception("Test error")) as mock_get_folder, \
+            patch('logging.error') as mock_logging_error:
+
+        # Call the method, this time expecting an exception to be raised
+            self.cleaner.clean(county)
+
+        # Ensure logging.error is called with the exception message
+            mock_logging_error.assert_called_once_with(f"Error during cleaning process for county: {county}. Error: Test error")
